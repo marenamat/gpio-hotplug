@@ -33,6 +33,23 @@ support for now, sorry). The device tree also explicitly defines how the
 sockets are wired to GPIO. Multiple sockets may share one GPIO pin, e.g. there
 may be a two-data-line socket sharing pins with two single-data-line sockets.
 
+Sockets and the bus are defined like this:
+
+```
+gpio_hotplug {
+	compatible = "gpio_hotplug,bus";
+	data-gpios = ...;	/* All the GPIO pins serving data */
+
+	socket@0 {
+		data-lines = ...;	/* Indexes of data lines in the parent structure */
+		power-gpios = ...;	/* One GPIO pin for power switching */
+		led-gpios = ...;	/* One GPIO pin for status LED (optional) */
+	};
+	socket@1 { ... };
+	...
+};
+```
+
 By default, all sockets are off. All assigned data ports are set to input,
 status LEDs are green. After a device is plugged into a socket, the socket is
 turned on by writing the appropriate config string into its sysfs control file.
