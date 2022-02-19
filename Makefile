@@ -7,3 +7,6 @@ all:
 
 clean:
 	make -C /lib/modules/$(VERSION)/build M=$(PWD) clean
+
+%.dtbo: %.dtso
+	dtc -W no-unit_address_vs_reg -I dts -O dtb $< -o $@

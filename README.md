@@ -41,6 +41,7 @@ gpio_hotplug {
 	data-gpios = ...;	/* All the GPIO pins serving data */
 
 	socket@0 {
+		label = "...";		/* Socket label */
 		data-lines = ...;	/* Indexes of data lines in the parent structure */
 		power-gpios = ...;	/* One GPIO pin for power switching */
 		led-gpios = ...;	/* One GPIO pin for status LED (optional) */

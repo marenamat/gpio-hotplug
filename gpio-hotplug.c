@@ -17,16 +17,17 @@
 #include <linux/property.h>
 
 struct bus_type gpio_hotplug_bus_type = {
-	.name		= "gpio_hotplug",
+	.name		= "gpio-hotplug",
 };
 
-#define MAX_DATA_LINES	12
+#define GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES	12
 
 struct gpio_hotplug_socket {
 	struct gpio_desc *power_gpio;
 	struct gpio_desc *led_gpio;
+	const char *name;
 	uint8_t data_lines_count;
-	uint8_t data_lines[MAX_DATA_LINES];
+	uint8_t data_lines[GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES];
 };
 
 struct gpio_hotplug_bus_device {
@@ -36,6 +37,8 @@ struct gpio_hotplug_bus_device {
 	struct gpio_hotplug_socket sockets[];
 };
 
+#define CHECK(cond, ret, ...)	if (cond) { dev_err(dev, __VA_ARGS__); return ret; }
+
 static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -43,57 +46,76 @@ static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 	struct gpio_hotplug_bus_device *bus_dev;
 	int count;
 
+	printk("GPIO Hotplug bus probe\n");
+
 	count = device_get_child_node_count(dev);
-	if (!count)
-		return -ENODEV;
+	CHECK(!count, -ENODEV, "No child nodes\n");
 
 	bus_dev = devm_kzalloc(dev, struct_size(bus_dev, sockets, count), GFP_KERNEL);
-	if (!bus_dev)
-		return -ENOMEM;
+	CHECK(!bus_dev, -ENOMEM, "Not enough memory\n");
+	printk("Allocated OK\n");
 
 	bus_dev->dev = dev;
 	bus_dev->data_gpio = devm_gpiod_get_array(dev, "data", GPIOD_IN);
-	if (IS_ERR(bus_dev->data_gpio))
-		return PTR_ERR(bus_dev->data_gpio);
+	CHECK(IS_ERR(bus_dev->data_gpio), PTR_ERR(bus_dev->data_gpio), "Data GPIO fetch failed: %ld\n", PTR_ERR(bus_dev->data_gpio));
+	printk("Have %d data gpios\n", bus_dev->data_gpio->ndescs);
+
+
+#define CHECK_CHILD(cond, ret, ...)	if (cond) { fwnode_handle_put(child); dev_err(dev, __VA_ARGS__); return ret; }
 
 	device_for_each_child_node(dev, child) {
 		struct gpio_hotplug_socket *sock = &bus_dev->sockets[bus_dev->num_sockets];
-		int dlcount = 0, err, i;
+		int dlcount = 0, i;
+		int err;
+		uint32_t data_lines[GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES];
+
+		err = fwnode_property_read_string(child, "label", &sock->name);
+		CHECK_CHILD(err, err, "Socket without label\n");
 
 		sock->power_gpio = devm_fwnode_get_gpiod_from_child(dev, "power", child, GPIOD_OUT_LOW, NULL);
-		if (IS_ERR(sock->power_gpio))
-			return PTR_ERR(sock->power_gpio);
+		CHECK_CHILD(IS_ERR(sock->power_gpio), PTR_ERR(sock->power_gpio),
+				"Socket %s power pin error: %ld\n", sock->name, PTR_ERR(sock->power_gpio));
 
 		sock->led_gpio = devm_fwnode_get_gpiod_from_child(dev, "led", child, GPIOD_OUT_LOW, NULL);
 		if (IS_ERR(sock->led_gpio)) {
-			if (PTR_ERR(sock->led_gpio) == -ENOENT)
-				sock->led_gpio = NULL;
-			else
-				return PTR_ERR(sock->led_gpio);
+			CHECK_CHILD(
+				(PTR_ERR(sock->led_gpio) != -ENOENT),
+				PTR_ERR(sock->led_gpio),
+				"Socket %s LED pin error: %ld\n", sock->name, PTR_ERR(sock->led_gpio));
+
+			sock->led_gpio = NULL;
 		}
 
-		dlcount = fwnode_property_count_u8(child, "data-lines");
-		if (dlcount > MAX_DATA_LINES)
-			return -EINVAL;
+		dlcount = fwnode_property_count_u32(child, "data-lines");
+		CHECK_CHILD(dlcount >= GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES,
+			-EINVAL,
+			"Socket %s has too many data lines: %d\n", sock->name, dlcount);
 
-		err = fwnode_property_read_u8_array(child, "data-lines", sock->data_lines, dlcount);
-		if (err)
-			return err;
+		err = fwnode_property_read_u32_array(child, "data-lines", data_lines, dlcount);
+		CHECK_CHILD(err, err,
+			"Socket %s data line array read error: %d\n", sock->name, err);
 
 		for (i = 0; i < dlcount; i++) {
-			if (sock->data_lines[i] >= bus_dev->data_gpio->ndescs)
-				return -EINVAL;
+			CHECK_CHILD(data_lines[i] >= bus_dev->data_gpio->ndescs,
+				-EINVAL,
+				"Socket %s data line %d index %d out of bounds (%d)\n",
+				sock->name, i, data_lines[i], bus_dev->data_gpio->ndescs);
+
+			sock->data_lines[i] = data_lines[i];
 		}
 
-		bus_dev->num_sockets = 0;
+		bus_dev->num_sockets++;
 	}
+
+	platform_set_drvdata(pdev, bus_dev);
+	printk("Registered %d gpio hotplug sockets\n", bus_dev->num_sockets);
 
 	return 0;
 }
 
 
 static const struct of_device_id of_gpio_hotplug_bus_match[] = {
-	{ .compatible = "gpio_hotplug,bus", },
+	{ .compatible = "gpio-hotplug,bus", },
 	{},
 };
 
@@ -103,8 +125,8 @@ static struct platform_driver gpio_hotplug_bus_driver = {
 	.probe		= gpio_hotplug_bus_probe,
 /*	.shutdown	= gpio_hotplug_bus_shutdown, */	/* Not needed for now */
 	.driver		= {
-		.name	= "gpio_hotplug_bus",
-		.of_match_table = of_gpio_hotplug_bus_match,
+		.name	= "gpio-hotplug,bus",
+		.of_match_table = of_match_ptr(of_gpio_hotplug_bus_match),
 	},
 };
 
@@ -119,6 +141,7 @@ int __init gpio_hotplug_init(void)
 	if (e)
 		goto err_platform_driver;
 
+	printk("GPIO hotplug initialized\n");
 	return 0;
 
 err_platform_driver:

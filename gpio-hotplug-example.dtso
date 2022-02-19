@@ -1,0 +1,64 @@
+/* 
+ *	Example Device Tree Overlay for GPIO Hotplug Bus
+ *
+ *	(c) 2022 Maria Matejka <mq@jmq.cz>
+ *
+ *	Can be freely distributed and used under the terms of the GNU GPL 2.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+			gpio-hotplug@0 {
+				compatible = "gpio-hotplug,bus";
+				data-gpios =	<&gpio  7 0>,
+						<&gpio  8 0>,
+						<&gpio  9 0>,
+						<&gpio 10 0>,
+						<&gpio 11 0>,
+						<&gpio 12 0>;
+				socket-A {
+					label = "A";
+					data-lines = <0>;
+					power-gpios = <&gpio 13 0>;
+					led-gpios = <&gpio 14 0>;
+				};
+				socket-B {
+					label = "B";
+					data-lines = <1>;
+					power-gpios = <&gpio 15 0>;
+					led-gpios = <&gpio 16 0>;
+				};
+				socket-C {
+					label = "C";
+					data-lines = <0>, <1>;
+					power-gpios = <&gpio 17 0>;
+					led-gpios = <&gpio 18 0>;
+				};
+				socket-D {
+					label = "D";
+					data-lines = <2>;
+					power-gpios = <&gpio 19 0>;
+					led-gpios = <&gpio 20 0>;
+				};
+				socket-E {
+					label = "E";
+					data-lines = <3>;
+					power-gpios = <&gpio 21 0>;
+					led-gpios = <&gpio 22 0>;
+				};
+				socket-F {
+					label = "F";
+					data-lines = <2>, <3>, <4>, <5>;
+					power-gpios = <&gpio 23 0>;
+					led-gpios = <&gpio 24 0>;
+				};
+			};
+		};
+	};
+};
+
