@@ -11,6 +11,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -26,6 +27,7 @@ struct gpio_hotplug_socket {
 	struct gpio_desc *power_gpio;
 	struct gpio_desc *led_gpio;
 	const char *name;
+	struct device dev;
 	uint8_t data_lines_count;
 	uint8_t data_lines[GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES];
 };
@@ -38,6 +40,15 @@ struct gpio_hotplug_bus_device {
 };
 
 #define CHECK(cond, ret, ...)	if (cond) { dev_err(dev, __VA_ARGS__); return ret; }
+
+static void gpio_hotplug_socket_release(struct device *dev)
+{
+	/* There is honestly nothing to do! */
+}
+
+struct device_type gpio_hotplug_socket_type = {
+	.release	= gpio_hotplug_socket_release,
+};
 
 static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 {
@@ -104,6 +115,15 @@ static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 			sock->data_lines[i] = data_lines[i];
 		}
 
+		sock->dev.parent = bus_dev->dev;
+		sock->dev.bus = &gpio_hotplug_bus_type;
+		sock->dev.type = &gpio_hotplug_socket_type;
+
+		dev_set_name(&sock->dev, "socket-%s", sock->name);
+
+		err = device_register(&sock->dev);
+		CHECK_CHILD(err, err, "Failed to device socket %s: %d\n", sock->name, err);
+
 		bus_dev->num_sockets++;
 	}
 
@@ -113,6 +133,19 @@ static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static int gpio_hotplug_remove_socket_dev(struct device *dev, void *_unused)
+{
+	struct gpio_hotplug_socket *sock = container_of(dev, struct gpio_hotplug_socket, dev);
+	printk("Removing socket %s\n", sock->name);
+	device_unregister(dev);
+	return 0;
+}
+
+static void gpio_hotplug_bus_shutdown(struct platform_device *pdev)
+{
+	printk("Bus shutdown: %s\n", dev_name(&pdev->dev));
+	bus_for_each_dev(&gpio_hotplug_bus_type, NULL, NULL, gpio_hotplug_remove_socket_dev);
+}
 
 static const struct of_device_id of_gpio_hotplug_bus_match[] = {
 	{ .compatible = "gpio-hotplug,bus", },
@@ -123,7 +156,7 @@ MODULE_DEVICE_TABLE(of, of_gpio_hotplug_bus_match);
 
 static struct platform_driver gpio_hotplug_bus_driver = {
 	.probe		= gpio_hotplug_bus_probe,
-/*	.shutdown	= gpio_hotplug_bus_shutdown, */	/* Not needed for now */
+	.shutdown	= gpio_hotplug_bus_shutdown,
 	.driver		= {
 		.name	= "gpio-hotplug,bus",
 		.of_match_table = of_match_ptr(of_gpio_hotplug_bus_match),
@@ -152,6 +185,8 @@ err_bus:
 
 void __exit gpio_hotplug_exit(void)
 {
+	printk("Module removal\n");
+	bus_for_each_dev(&gpio_hotplug_bus_type, NULL, NULL, gpio_hotplug_remove_socket_dev);
 	platform_driver_unregister(&gpio_hotplug_bus_driver);
 	bus_unregister(&gpio_hotplug_bus_type);
 }
