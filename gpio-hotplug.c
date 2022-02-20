@@ -13,9 +13,12 @@
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
+
+static DEFINE_MUTEX(gpio_hotplug_mutex);
 
 struct bus_type gpio_hotplug_bus_type = {
 	.name		= "gpio-hotplug",
@@ -28,18 +31,54 @@ struct gpio_hotplug_socket {
 	struct gpio_desc *led_gpio;
 	const char *name;
 	struct device dev;
+
+	int socket_index;
+
+	uint8_t status;
+
 	uint8_t data_lines_count;
 	uint8_t data_lines[GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES];
 };
 
-struct gpio_hotplug_bus_device {
+#define GPIO_HOTPLUG_SOCKET_STATUS_OFF		0
+#define GPIO_HOTPLUG_SOCKET_STATUS_ON		1
+#define GPIO_HOTPLUG_SOCKET_STATUS_BLOCKED	2
+
+const char *gpio_hotplug_socket_status_name[] = {
+	[GPIO_HOTPLUG_SOCKET_STATUS_OFF]	= "off",
+	[GPIO_HOTPLUG_SOCKET_STATUS_ON]		= "on",
+	[GPIO_HOTPLUG_SOCKET_STATUS_BLOCKED]	= "blocked",
+};
+
+struct gpio_hotplug_bus_data {
 	struct device *dev;
 	struct gpio_descs *data_gpio;
+	struct gpio_hotplug_socket *data_used_by;
 	int num_sockets;
 	struct gpio_hotplug_socket sockets[];
 };
 
-#define CHECK(cond, ret, ...)	if (cond) { dev_err(dev, __VA_ARGS__); return ret; }
+static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gpio_hotplug_socket *sock;
+	ssize_t out;
+
+	if (mutex_lock_interruptible(&gpio_hotplug_mutex))
+		return -EINTR;
+
+	sock = container_of(dev, struct gpio_hotplug_socket, dev);
+	out = sprintf(buf, "%s\n", gpio_hotplug_socket_status_name[sock->status]);
+
+	mutex_unlock(&gpio_hotplug_mutex);
+	return out;
+}
+static DEVICE_ATTR_RO(status);
+
+static struct attribute *gpio_hotplug_socket_attrs[] = {
+	&dev_attr_status.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(gpio_hotplug_socket);
 
 static void gpio_hotplug_socket_release(struct device *dev)
 {
@@ -47,15 +86,26 @@ static void gpio_hotplug_socket_release(struct device *dev)
 }
 
 struct device_type gpio_hotplug_socket_type = {
+	.groups		= gpio_hotplug_socket_groups,
 	.release	= gpio_hotplug_socket_release,
 };
 
 static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 {
+
+#define CHECK(cond, ret, ...)				\
+	if (cond) {					\
+		dev_err(dev, __VA_ARGS__);		\
+		mutex_unlock(&gpio_hotplug_mutex);	\
+		return ret;				\
+	}
+
 	struct device *dev = &pdev->dev;
 	struct fwnode_handle *child;
-	struct gpio_hotplug_bus_device *bus_dev;
+	struct gpio_hotplug_bus_data *bus_dev;
 	int count;
+
+	mutex_lock(&gpio_hotplug_mutex);
 
 	printk("GPIO Hotplug bus probe\n");
 
@@ -71,14 +121,21 @@ static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 	CHECK(IS_ERR(bus_dev->data_gpio), PTR_ERR(bus_dev->data_gpio), "Data GPIO fetch failed: %ld\n", PTR_ERR(bus_dev->data_gpio));
 	printk("Have %d data gpios\n", bus_dev->data_gpio->ndescs);
 
-
-#define CHECK_CHILD(cond, ret, ...)	if (cond) { fwnode_handle_put(child); dev_err(dev, __VA_ARGS__); return ret; }
+#define CHECK_CHILD(cond, ret, ...)			\
+	if (cond) {					\
+		fwnode_handle_put(child);		\
+		dev_err(dev, __VA_ARGS__);		\
+		mutex_unlock(&gpio_hotplug_mutex);	\
+		return ret;				\
+	}
 
 	device_for_each_child_node(dev, child) {
 		struct gpio_hotplug_socket *sock = &bus_dev->sockets[bus_dev->num_sockets];
 		int dlcount = 0, i;
 		int err;
 		uint32_t data_lines[GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES];
+
+		sock->socket_index = bus_dev->num_sockets;
 
 		err = fwnode_property_read_string(child, "label", &sock->name);
 		CHECK_CHILD(err, err, "Socket without label\n");
@@ -115,9 +172,12 @@ static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 			sock->data_lines[i] = data_lines[i];
 		}
 
+		sock->data_lines_count = dlcount;
+
 		sock->dev.parent = bus_dev->dev;
 		sock->dev.bus = &gpio_hotplug_bus_type;
 		sock->dev.type = &gpio_hotplug_socket_type;
+		sock->dev.driver_data = bus_dev;
 
 		dev_set_name(&sock->dev, "socket-%s", sock->name);
 
@@ -127,10 +187,16 @@ static int gpio_hotplug_bus_probe(struct platform_device *pdev)
 		bus_dev->num_sockets++;
 	}
 
+	bus_dev->data_used_by = devm_kzalloc(dev, sizeof(*bus_dev->data_used_by) * bus_dev->num_sockets, GFP_KERNEL);
+
 	platform_set_drvdata(pdev, bus_dev);
 	printk("Registered %d gpio hotplug sockets\n", bus_dev->num_sockets);
 
+	mutex_unlock(&gpio_hotplug_mutex);
+
 	return 0;
+#undef CHECK
+#undef CHECK_CHILD
 }
 
 static int gpio_hotplug_remove_socket_dev(struct device *dev, void *_unused)
@@ -143,8 +209,10 @@ static int gpio_hotplug_remove_socket_dev(struct device *dev, void *_unused)
 
 static void gpio_hotplug_bus_shutdown(struct platform_device *pdev)
 {
+	mutex_lock(&gpio_hotplug_mutex);
 	printk("Bus shutdown: %s\n", dev_name(&pdev->dev));
 	bus_for_each_dev(&gpio_hotplug_bus_type, NULL, NULL, gpio_hotplug_remove_socket_dev);
+	mutex_unlock(&gpio_hotplug_mutex);
 }
 
 static const struct of_device_id of_gpio_hotplug_bus_match[] = {
@@ -166,6 +234,7 @@ static struct platform_driver gpio_hotplug_bus_driver = {
 int __init gpio_hotplug_init(void)
 {
 	int e = 0;
+
 	e = bus_register(&gpio_hotplug_bus_type);
 	if (e)
 		goto err_bus;
@@ -186,7 +255,11 @@ err_bus:
 void __exit gpio_hotplug_exit(void)
 {
 	printk("Module removal\n");
+
+	mutex_lock(&gpio_hotplug_mutex);
 	bus_for_each_dev(&gpio_hotplug_bus_type, NULL, NULL, gpio_hotplug_remove_socket_dev);
+	mutex_unlock(&gpio_hotplug_mutex);
+
 	platform_driver_unregister(&gpio_hotplug_bus_driver);
 	bus_unregister(&gpio_hotplug_bus_type);
 }
