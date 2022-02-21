@@ -96,7 +96,7 @@ static void gpio_hotplug_socket_recalculate_blocked(struct gpio_hotplug_bus_data
 
 		/* Any data line used by other socket makes this socket blocked */
 		for (d = 0; d < sock->data_lines_count; d++)
-			if (bus_dev->data_used_by[sock->data_lines[i]]) {
+			if (bus_dev->data_used_by[sock->data_lines[d]]) {
 				sock->state = GPIO_HOTPLUG_SOCKET_STATE_BLOCKED;
 				break;
 			}
@@ -115,7 +115,7 @@ static void gpio_hotplug_socket_recalculate_off(struct gpio_hotplug_bus_data *bu
 
 		/* Any data line used by other socket keeps this socket blocked */
 		for (d = 0; d < sock->data_lines_count; d++)
-			if (bus_dev->data_used_by[sock->data_lines[i]])
+			if (bus_dev->data_used_by[sock->data_lines[d]])
 				break;
 
 		/* No data line used, mark as off */
@@ -161,9 +161,17 @@ static void gpio_hotplug_led_unplug(struct gpio_hotplug_bus_data *bus_dev, struc
 {
 	struct gpio_hotplug_led_pdev *pdata_packed = sock->child_data;
 
+	printk("Device unregister before.\n");
 	platform_device_unregister(&pdata_packed->pdev);
+	printk("Device unregister after.\n");
 	kfree(pdata_packed->names);
 	kfree(pdata_packed);
+}
+
+static void gpio_hotplug_led_release(struct device *dev)
+{
+//	struct gpio_hotplug_led_pdev *pdata_packed =
+	printk("LED release\n");
 }
 
 static ssize_t gpio_hotplug_led_create(struct gpio_hotplug_bus_data *bus_dev, struct gpio_hotplug_socket *sock, const char *buf, size_t count)
@@ -207,6 +215,8 @@ static ssize_t gpio_hotplug_led_create(struct gpio_hotplug_bus_data *bus_dev, st
 
 		*blank = 0;
 
+		printk("LED %d on pin %d named %s\n", i, sock->data_lines[i], names);
+
 		pdata_packed->leds[i].name = names;
 		pdata_packed->leds[i].default_trigger = "none";
 		pdata_packed->leds[i].gpiod = bus_dev->data_gpio->desc[sock->data_lines[i]];
@@ -221,6 +231,7 @@ static ssize_t gpio_hotplug_led_create(struct gpio_hotplug_bus_data *bus_dev, st
 	pdata_packed->pdev.name = "leds-gpio";
 	pdata_packed->pdev.id = -1;
 	pdata_packed->pdev.dev.platform_data = &pdata_packed->pdata;
+	pdata_packed->pdev.dev.release = gpio_hotplug_led_release;
 
 	/* Register the device */
 	result = platform_device_register(&pdata_packed->pdev);
