@@ -12,11 +12,13 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
+#include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
+#include <linux/slab.h>
 
 static DEFINE_MUTEX(gpio_hotplug_mutex);
 
@@ -24,7 +26,7 @@ struct bus_type gpio_hotplug_bus_type = {
 	.name		= "gpio-hotplug",
 };
 
-#define GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES	12
+struct gpio_hotplug_bus_data;
 
 struct gpio_hotplug_socket {
 	struct gpio_desc *power_gpio;
@@ -34,31 +36,317 @@ struct gpio_hotplug_socket {
 
 	int socket_index;
 
-	uint8_t status;
+	uint8_t state;
 
 	uint8_t data_lines_count;
+#define GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES	12
 	uint8_t data_lines[GPIO_HOTPLUG_SOCKET_MAX_DATA_LINES];
+
+	void *child_data;
+	void (*unplug)(struct gpio_hotplug_bus_data *, struct gpio_hotplug_socket *);
 };
 
-#define GPIO_HOTPLUG_SOCKET_STATUS_OFF		0
-#define GPIO_HOTPLUG_SOCKET_STATUS_ON		1
-#define GPIO_HOTPLUG_SOCKET_STATUS_BLOCKED	2
+#define GPIO_HOTPLUG_SOCKET_STATE_OFF		0
+#define GPIO_HOTPLUG_SOCKET_STATE_ON		1
+#define GPIO_HOTPLUG_SOCKET_STATE_BLOCKED	2
 
-const char *gpio_hotplug_socket_status_name[] = {
-	[GPIO_HOTPLUG_SOCKET_STATUS_OFF]	= "off",
-	[GPIO_HOTPLUG_SOCKET_STATUS_ON]		= "on",
-	[GPIO_HOTPLUG_SOCKET_STATUS_BLOCKED]	= "blocked",
+const char *gpio_hotplug_socket_state_name[] = {
+	[GPIO_HOTPLUG_SOCKET_STATE_OFF]	= "off",
+	[GPIO_HOTPLUG_SOCKET_STATE_ON]		= "on",
+	[GPIO_HOTPLUG_SOCKET_STATE_BLOCKED]	= "blocked",
 };
 
 struct gpio_hotplug_bus_data {
 	struct device *dev;
 	struct gpio_descs *data_gpio;
-	struct gpio_hotplug_socket *data_used_by;
+	struct gpio_hotplug_socket **data_used_by;
 	int num_sockets;
 	struct gpio_hotplug_socket sockets[];
 };
 
-static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
+static int gpio_hotplug_socket_state_check_off(struct gpio_hotplug_bus_data *bus_dev, struct gpio_hotplug_socket *sock)
+{
+	int i;
+
+	if (sock->state != GPIO_HOTPLUG_SOCKET_STATE_OFF)
+		return -EBUSY;
+
+	/* Check line state */
+	for (i = 0; i < sock->data_lines_count; i++) {
+		int id = sock->data_lines[i];
+		if (bus_dev->data_used_by[id] == NULL)
+			continue;
+
+		dev_err(&sock->dev, "Data line %d (idx %d) busy!\n", i, id);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static void gpio_hotplug_socket_recalculate_blocked(struct gpio_hotplug_bus_data *bus_dev)
+{
+	int i;
+	for (i = 0; i < bus_dev->num_sockets; i++)
+	{
+		int d;
+		struct gpio_hotplug_socket *sock = &bus_dev->sockets[i];
+		if (sock->state != GPIO_HOTPLUG_SOCKET_STATE_OFF)
+			continue;
+
+		/* Any data line used by other socket makes this socket blocked */
+		for (d = 0; d < sock->data_lines_count; d++)
+			if (bus_dev->data_used_by[sock->data_lines[i]]) {
+				sock->state = GPIO_HOTPLUG_SOCKET_STATE_BLOCKED;
+				break;
+			}
+	}
+}
+
+static void gpio_hotplug_socket_recalculate_off(struct gpio_hotplug_bus_data *bus_dev)
+{
+	int i;
+	for (i = 0; i < bus_dev->num_sockets; i++)
+	{
+		int d;
+		struct gpio_hotplug_socket *sock = &bus_dev->sockets[i];
+		if (sock->state != GPIO_HOTPLUG_SOCKET_STATE_BLOCKED)
+			continue;
+
+		/* Any data line used by other socket keeps this socket blocked */
+		for (d = 0; d < sock->data_lines_count; d++)
+			if (bus_dev->data_used_by[sock->data_lines[i]])
+				break;
+
+		/* No data line used, mark as off */
+		if (d == sock->data_lines_count)
+			sock->state = GPIO_HOTPLUG_SOCKET_STATE_OFF;
+	}
+}
+
+static void gpio_hotplug_socket_state_set_on(struct gpio_hotplug_bus_data *bus_dev, struct gpio_hotplug_socket *sock)
+{
+	int i;
+
+	/* Mark the data lines busy */
+	for (i = 0; i < sock->data_lines_count; i++)
+		bus_dev->data_used_by[sock->data_lines[i]] = sock;
+
+	sock->state = GPIO_HOTPLUG_SOCKET_STATE_ON;
+	gpio_hotplug_socket_recalculate_blocked(bus_dev);
+}
+
+static void gpio_hotplug_socket_state_set_off(struct gpio_hotplug_bus_data *bus_dev, struct gpio_hotplug_socket *sock)
+{
+	int i;
+
+	/* Mark the data lines free */
+	for (i = 0; i < sock->data_lines_count; i++)
+		bus_dev->data_used_by[sock->data_lines[i]] = NULL;
+
+	sock->state = GPIO_HOTPLUG_SOCKET_STATE_OFF;
+	gpio_hotplug_socket_recalculate_off(bus_dev);
+}
+
+#define find_blank(buf)	(strchr(buf, ' ') ?: strchr(buf, '\n'))
+
+struct gpio_hotplug_led_pdev {
+	struct platform_device pdev;
+	struct gpio_led_platform_data pdata;
+	const char *names;
+	struct gpio_led leds[];
+};
+
+static void gpio_hotplug_led_unplug(struct gpio_hotplug_bus_data *bus_dev, struct gpio_hotplug_socket *sock)
+{
+	struct gpio_hotplug_led_pdev *pdata_packed = sock->child_data;
+
+	platform_device_unregister(&pdata_packed->pdev);
+	kfree(pdata_packed->names);
+	kfree(pdata_packed);
+}
+
+static ssize_t gpio_hotplug_led_create(struct gpio_hotplug_bus_data *bus_dev, struct gpio_hotplug_socket *sock, const char *buf, size_t count)
+{
+	int i, result;
+	char *blank, *names;
+	struct gpio_hotplug_led_pdev *pdata_packed;
+
+	if (count <= 1)
+		return -EINVAL;
+
+	/* Allocate everything */
+	pdata_packed = kzalloc(struct_size(pdata_packed, leds, sock->data_lines_count), GFP_KERNEL);
+	if (!pdata_packed)
+		return -ENOMEM;
+
+	names = kmalloc(count+1, GFP_KERNEL);
+	if (!names) {
+		result = -ENOMEM;
+		goto free_pdata;
+	}
+
+	/* Fill in the LED info structure */
+	memcpy(names, buf, count);
+	pdata_packed->names = names;
+
+	for (i = 0; i < sock->data_lines_count; i++) {
+		/* Parse another LED name */
+		if (count <= 1) {
+			dev_err(&sock->dev, "Not enough names\n");
+			result = -EINVAL;
+			goto free_names;
+		}
+
+		blank = find_blank(names);
+		if ((!blank) || (blank == names)) {
+			dev_err(&sock->dev, "Invalid name for LED %d\n", i);
+			result = -EINVAL;
+			goto free_names;
+		}
+
+		*blank = 0;
+
+		pdata_packed->leds[i].name = names;
+		pdata_packed->leds[i].default_trigger = "none";
+		pdata_packed->leds[i].gpiod = bus_dev->data_gpio->desc[sock->data_lines[i]];
+
+		names = blank + 1;
+	}
+
+	pdata_packed->pdata.num_leds = sock->data_lines_count;
+	pdata_packed->pdata.leds = pdata_packed->leds;
+
+	/* Fill in the platform device */
+	pdata_packed->pdev.name = "leds-gpio";
+	pdata_packed->pdev.id = -1;
+	pdata_packed->pdev.dev.platform_data = &pdata_packed->pdata;
+
+	/* Register the device */
+	result = platform_device_register(&pdata_packed->pdev);
+	if (result) {
+		dev_err(&sock->dev, "Failed to register LEDS: %d\n", result);
+		goto free_names;
+	}
+
+	/* Store device-specific information to the socket */
+	sock->child_data = pdata_packed;
+	sock->unplug = gpio_hotplug_led_unplug;
+
+	return 0;
+
+free_names:
+	kfree(names);
+free_pdata:
+	kfree(pdata_packed);
+	return result;
+}
+
+struct {
+	const char *type;
+	ssize_t (*create)(struct gpio_hotplug_bus_data *, struct gpio_hotplug_socket *, const char *, size_t);
+} new_device_match_table[] = {
+	{ "LED", gpio_hotplug_led_create },
+};
+
+#define MATCH_TABLE_SIZE	(sizeof(new_device_match_table) / sizeof(new_device_match_table[0]))
+
+static ssize_t new_device_store(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct gpio_hotplug_socket *sock = container_of(dev, struct gpio_hotplug_socket, dev);
+	struct gpio_hotplug_bus_data *bus_dev = sock->dev.driver_data;
+	const char *blank;
+	int i;
+
+	if (count <= 2)
+		return -EINVAL;
+
+	blank = find_blank(buf);
+	if (!blank) {
+		dev_err(dev, "Garbled input, no blank char.\n");
+		return -EINVAL;
+	}
+
+	if (!try_module_get(THIS_MODULE))
+		return -ENODEV;
+
+	for (i = 0; i < MATCH_TABLE_SIZE; i++) {
+		int result;
+		ssize_t (*create)(struct gpio_hotplug_bus_data *, struct gpio_hotplug_socket *, const char *, size_t);
+
+		if (strncasecmp(buf, new_device_match_table[i].type, blank - buf))
+			continue;
+
+		create = new_device_match_table[i].create;
+
+		if (mutex_lock_interruptible(&gpio_hotplug_mutex))
+		{
+			module_put(THIS_MODULE);
+			return -EINTR;
+		}
+
+		/* Check that the socket is actually free */
+		result = gpio_hotplug_socket_state_check_off(bus_dev, sock);
+		if (result) {
+			mutex_unlock(&gpio_hotplug_mutex);
+			module_put(THIS_MODULE);
+			return result;
+		}
+
+		/* Create the device */
+		result = create(bus_dev, sock, blank + 1, count - 1 - (blank - buf));
+		if (result) {
+			mutex_unlock(&gpio_hotplug_mutex);
+			module_put(THIS_MODULE);
+			return result;
+		}
+
+		/* And switch it on */
+		gpio_hotplug_socket_state_set_on(bus_dev, sock);
+
+		mutex_unlock(&gpio_hotplug_mutex);
+		return count;
+	}
+
+	dev_err(dev, "new_device: Unknown type\n");
+	module_put(THIS_MODULE);
+	return -EINVAL;
+}
+static DEVICE_ATTR_WO(new_device);
+
+static ssize_t delete_device_store(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct gpio_hotplug_socket *sock = container_of(dev, struct gpio_hotplug_socket, dev);
+	struct gpio_hotplug_bus_data *bus_dev = sock->dev.driver_data;
+
+	if (mutex_lock_interruptible(&gpio_hotplug_mutex))
+		return -EINTR;
+
+	if (sock->state != GPIO_HOTPLUG_SOCKET_STATE_ON) {
+		mutex_unlock(&gpio_hotplug_mutex);
+		return -EINVAL;
+	}
+
+	/* Unplug the driver */
+	sock->unplug(bus_dev, sock);
+
+	/* Switch the device off */
+	gpio_hotplug_socket_state_set_off(bus_dev, sock);
+
+	/* Cleanup */
+	sock->child_data = NULL;
+	sock->unplug = NULL;
+
+	mutex_unlock(&gpio_hotplug_mutex);
+	module_put(THIS_MODULE);
+
+	return count;
+}
+static DEVICE_ATTR_WO(delete_device);
+
+static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct gpio_hotplug_socket *sock;
 	ssize_t out;
@@ -67,15 +355,17 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 		return -EINTR;
 
 	sock = container_of(dev, struct gpio_hotplug_socket, dev);
-	out = sprintf(buf, "%s\n", gpio_hotplug_socket_status_name[sock->status]);
+	out = sprintf(buf, "%s\n", gpio_hotplug_socket_state_name[sock->state]);
 
 	mutex_unlock(&gpio_hotplug_mutex);
 	return out;
 }
-static DEVICE_ATTR_RO(status);
+static DEVICE_ATTR_RO(state);
 
 static struct attribute *gpio_hotplug_socket_attrs[] = {
-	&dev_attr_status.attr,
+	&dev_attr_state.attr,
+	&dev_attr_new_device.attr,
+	&dev_attr_delete_device.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(gpio_hotplug_socket);

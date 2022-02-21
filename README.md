@@ -67,6 +67,7 @@ containing following files:
 
 * reading from `status` returns "off", "on" or "blocked"
 * writing to `new_device` switches the port on or returns an error (mostly -EBUSY)
+  * Format: `<device_type> <device_name> <other args>`
 * writing to `delete_device` switches the port off
 
 ------
